@@ -147,6 +147,13 @@ QDialog QPushButton { background: $button_bg; border: 1px solid $button_border; 
 QDialog QPushButton:hover { background: $button_hover; }
 QDialog QPushButton:pressed, QDialog QPushButton:checked { background: $button_pressed; }
 QDialog QPushButton:disabled { color: $disabled_text; }
+QFrame#section { border: 1px solid $group_border; border-radius: 18px; background: $group_bg; }
+QPushButton#sectionHeader, QPushButton#sectionHeader:checked, QPushButton#sectionHeader:pressed {
+    border: none; background: transparent; font-weight: 600; text-align: left; padding: 8px 6px; color: $text; }
+QPushButton#sectionHeader:hover { color: $title; background: transparent; }
+QLabel#keyHeading { font-weight: 600; }
+QScrollArea#settingsScroll, QWidget#settingsContent { background: transparent; }
+QScrollArea#settingsScroll > QWidget#qt_scrollarea_viewport { background: transparent; }
 QGroupBox { font-weight: 600; border: 1px solid $group_border; border-radius: 18px; margin-top: 12px; padding: 14px 12px 12px 12px; background: $group_bg; }
 QGroupBox::title { subcontrol-origin: margin; left: 14px; padding: 0 4px; }
 QLineEdit, QComboBox { background: $input_bg; border: 1px solid $input_border; border-radius: 14px; padding: 5px 12px; min-height: 18px; }

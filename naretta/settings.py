@@ -12,8 +12,12 @@ from .config import (
     DEFAULT_VOICE_VOLUME,
     DEFAULT_THEME,
     DEFAULT_MIC_MODE,
+    DEFAULT_PROVIDER,
+    DEFAULT_SARVAM_VOICE,
     DEFAULT_VOICE,
     MIC_MODES,
+    PROVIDERS,
+    SARVAM_VOICES,
     VOICES,
     LISTEN_MODES,
     THEMES,
@@ -57,6 +61,24 @@ class SettingsStore:
     @voice.setter
     def voice(self, voice: str) -> None:
         self._s.setValue("assistant/voice", voice)
+
+    @property
+    def provider(self) -> str:
+        provider = self._get("assistant/provider")
+        return provider if provider in PROVIDERS else DEFAULT_PROVIDER
+
+    @provider.setter
+    def provider(self, provider: str) -> None:
+        self._s.setValue("assistant/provider", provider)
+
+    @property
+    def sarvam_voice(self) -> str:
+        voice = self._get("assistant/sarvam_voice")
+        return voice if voice in SARVAM_VOICES else DEFAULT_SARVAM_VOICE
+
+    @sarvam_voice.setter
+    def sarvam_voice(self, voice: str) -> None:
+        self._s.setValue("assistant/sarvam_voice", voice)
 
     @property
     def mic_mode(self) -> str:
@@ -142,4 +164,6 @@ class SettingsStore:
             listen_mode=self.listen_mode,
             echo_cancellation=self.echo_cancellation,
             voice_volume=self.voice_volume,
+            provider=self.provider,
+            sarvam_voice=self.sarvam_voice,
         )

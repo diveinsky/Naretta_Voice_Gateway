@@ -52,6 +52,11 @@ class ConversationHistory:
         with self._lock:
             return not any(t.text for t in self._turns)
 
+    def chat_messages(self) -> list[dict]:
+        """The finished turns as chat-completion messages (role + content)."""
+        with self._lock:
+            return [{"role": t.role, "content": t.text} for t in self._turns if t.final and t.text.strip()]
+
     def replay_items(self) -> list[dict]:
         """Conversation items that recreate this history in a fresh Realtime session."""
         with self._lock:

@@ -13,6 +13,7 @@ from websockets.asyncio.server import serve
 
 from naretta import realtime
 from naretta.audio import PlaybackBuffer
+from naretta.capability_log import CapabilityLog
 from naretta.config import SessionConfig
 from naretta.realtime import CONNECTED, DISCONNECTED, RealtimeEngine
 
@@ -394,3 +395,176 @@ def test_clipping_microphone_warning():
         assert len(rec.of("notice")) == 1 and "too loud" in rec.of("notice")[0][0]
     finally:
         engine.shutdown()
+
+
+def test_missing_capability_is_recorded_and_answered(tmp_path):
+    rec = Recorder()
+    log = CapabilityLog(tmp_path / "missing.jsonl")
+    engine = RealtimeEngine(rec, audio_factory=fake_audio, capability_log=log)
+    seen = {}
+
+    async def handler(ws):
+        update = await recv_type(ws, "session.update")
+        seen["tools"] = update["session"]["tools"]
+        send = lambda e: ws.send(json.dumps(e))
+        await send({"type": "input_audio_buffer.speech_started", "item_id": "u1"})
+        await send({"type": "input_audio_buffer.speech_stopped", "item_id": "u1"})
+        await send({"type": "conversation.item.input_audio_transcription.completed", "item_id": "u1", "transcript": "What's the weather in Chennai?"})
+        await send({"type": "response.created", "response": {"id": "r1", "status": "in_progress"}})
+        call = {
+            "type": "function_call", "id": "f1", "status": "completed", "call_id": "call_1",
+            "name": "log_missing_capability",
+            "arguments": json.dumps({"request": "Weather in Chennai", "capability": "live weather", "reason": "No internet access"}),
+        }
+        await send({"type": "response.done", "response": {"id": "r1", "status": "completed", "output": [call]}})
+        seen["output"] = (await recv_type(ws, "conversation.item.create"))["item"]
+        await recv_type(ws, "response.create")  # she finishes her answer after the call
+        seen["done"] = True
+        await ws.wait_closed()
+
+    async def scenario():
+        async with serve(handler, "127.0.0.1", 0) as server:
+            engine.start(config(server.sockets[0].getsockname()[1]))
+            await wait_until(lambda: seen.get("done"))
+            engine.stop()
+            await wait_until(lambda: rec.of("state")[-1] == (DISCONNECTED,))
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        engine.shutdown()
+    assert [t["name"] for t in seen["tools"]] == ["log_missing_capability", "end_conversation"]
+    assert seen["output"]["type"] == "function_call_output" and seen["output"]["call_id"] == "call_1"
+    assert json.loads(seen["output"]["output"]) == {"ok": True}
+    [entry] = log.entries()
+    assert entry["capability"] == "live weather" and entry["request"] == "Weather in Chennai"
+
+
+def test_end_conversation_stops_after_the_goodbye(tmp_path):
+    rec = Recorder()
+    engine = RealtimeEngine(rec, audio_factory=fake_audio, capability_log=CapabilityLog(tmp_path / "m.jsonl"))
+    seen = {}
+
+    async def handler(ws):
+        update = await recv_type(ws, "session.update")
+        seen["tools"] = [t["name"] for t in update["session"]["tools"]]
+        send = lambda e: ws.send(json.dumps(e))
+        await send({"type": "response.created", "response": {"id": "r1", "status": "in_progress"}})
+        await send({"type": "response.output_item.added", "response_id": "r1", "item": {"id": "a1", "type": "message", "role": "assistant"}})
+        await send({"type": "response.output_audio.delta", "response_id": "r1", "item_id": "a1", "delta": audio_b64(500)})
+        await send({"type": "response.output_audio.done", "response_id": "r1", "item_id": "a1"})
+        call = {"type": "function_call", "id": "f1", "status": "completed", "call_id": "call_end", "name": "end_conversation", "arguments": "{}"}
+        await send({"type": "response.done", "response": {"id": "r1", "status": "completed", "output": [{"type": "message", "id": "a1"}, call]}})
+        seen["output"] = (await recv_type(ws, "conversation.item.create"))["item"]
+        seen["sent"] = True
+        try:
+            await recv_type(ws, "response.create", timeout=2)
+            seen["extra_reply"] = True
+        except Exception:
+            pass
+
+    async def scenario():
+        async with serve(handler, "127.0.0.1", 0) as server:
+            engine.start(config(server.sockets[0].getsockname()[1]))
+            await wait_until(lambda: seen.get("sent"))
+            await asyncio.sleep(0.3)
+            assert rec.of("state")[-1] == (CONNECTED,)  # still saying goodbye
+            FakeSpeaker.instances[-1].advance(500)
+            await wait_until(lambda: rec.of("state")[-1] == (DISCONNECTED,))
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        engine.shutdown()
+    assert seen["tools"] == ["log_missing_capability", "end_conversation"]
+    assert seen["output"]["call_id"] == "call_end"
+    assert "extra_reply" not in seen
+    assert FakeMic.instances[-1].closed  # devices released
+
+
+def test_silent_end_conversation_asks_for_a_goodbye_first(tmp_path):
+    rec = Recorder()
+    engine = RealtimeEngine(rec, audio_factory=fake_audio, capability_log=CapabilityLog(tmp_path / "m.jsonl"))
+    seen = {}
+
+    async def handler(ws):
+        await recv_type(ws, "session.update")
+        send = lambda e: ws.send(json.dumps(e))
+        call = {"type": "function_call", "id": "f1", "status": "completed", "call_id": "call_end", "name": "end_conversation", "arguments": "{}"}
+        await send({"type": "response.created", "response": {"id": "r1", "status": "in_progress"}})
+        await send({"type": "response.done", "response": {"id": "r1", "status": "completed", "output": [call]}})
+        seen["goodbye_request"] = (await recv_type(ws, "response.create"))["response"]
+        await send({"type": "response.created", "response": {"id": "r2", "status": "in_progress"}})
+        await send({"type": "response.output_item.added", "response_id": "r2", "item": {"id": "a2", "type": "message", "role": "assistant"}})
+        await send({"type": "response.output_audio.delta", "response_id": "r2", "item_id": "a2", "delta": audio_b64(300)})
+        await send({"type": "response.done", "response": {"id": "r2", "status": "completed", "output": [{"type": "message", "id": "a2"}]}})
+        seen["sent"] = True
+        await ws.wait_closed()
+
+    async def scenario():
+        async with serve(handler, "127.0.0.1", 0) as server:
+            engine.start(config(server.sockets[0].getsockname()[1]))
+            await wait_until(lambda: seen.get("sent"))
+            await asyncio.sleep(0.3)
+            assert rec.of("state")[-1] == (CONNECTED,)
+            FakeSpeaker.instances[-1].advance(300)
+            await wait_until(lambda: rec.of("state")[-1] == (DISCONNECTED,))
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        engine.shutdown()
+    assert seen["goodbye_request"]["tool_choice"] == "none"
+
+
+def test_running_out_of_credit_stops_with_a_clear_message():
+    rec = Recorder()
+    engine = RealtimeEngine(rec, audio_factory=fake_audio)
+    connections = []
+
+    async def handler(ws):
+        connections.append(ws)
+        await recv_type(ws, "session.update")
+        error = {"type": "insufficient_quota", "code": "credit_balance_exhausted", "message": "You have no credits remaining."}
+        await ws.send(json.dumps({"type": "error", "error": error}))
+        await ws.close(1013, "insufficient_quota.credit_balance_exhausted")
+
+    async def scenario():
+        async with serve(handler, "127.0.0.1", 0) as server:
+            engine.start(config(server.sockets[0].getsockname()[1]))
+            await wait_until(lambda: rec.of("error"))
+            await wait_until(lambda: rec.of("state")[-1] == (DISCONNECTED,))
+            await asyncio.sleep(0.3)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        engine.shutdown()
+    assert rec.of("error")[0][0].startswith("Your OpenAI credit has run out")
+    assert len(connections) == 1  # no pointless reconnecting
+    assert not any("Reconnecting" in n[0] for n in rec.of("notice"))
+    assert FakeMic.instances[-1].closed
+
+
+def test_connection_dropped_right_after_opening_gives_up():
+    rec = Recorder()
+    engine = RealtimeEngine(rec, audio_factory=fake_audio)
+    connections = []
+
+    async def handler(ws):
+        connections.append(ws)
+        await recv_type(ws, "session.update")
+        await ws.close(1011, "")  # accepted, then dropped at once, again and again
+
+    async def scenario():
+        async with serve(handler, "127.0.0.1", 0) as server:
+            engine.start(config(server.sockets[0].getsockname()[1]))
+            await wait_until(lambda: rec.of("error"))
+            await wait_until(lambda: rec.of("state")[-1] == (DISCONNECTED,))
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        engine.shutdown()
+    assert len(connections) == len(realtime.RECONNECT_DELAYS) + 1
+    assert "Gave up" in rec.of("error")[0][0]

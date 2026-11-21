@@ -8,19 +8,14 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from .config import APP_NAME
+from .config import APP_NAME, data_dir
 from .redact import RedactingFilter
 
 
-def _data_dir() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or str(Path.home() / ".local" / "share")
-    path = Path(base) / APP_NAME
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
 def _setup_logging() -> Path:
-    log_path = _data_dir() / "naretta.log"
+    folder = data_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    log_path = folder / "naretta.log"
     handler = RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     handler.addFilter(RedactingFilter())

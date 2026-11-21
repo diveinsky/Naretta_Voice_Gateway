@@ -3,9 +3,11 @@ import logging
 import numpy as np
 
 from naretta.audio import LinearResampler, PlaybackBuffer, apply_gain, voice_level
+from naretta.capability_log import CapabilityLog
 from naretta.history import ConversationHistory, estimate_heard_text
-from naretta.realtime import describe_http_status
+from naretta.realtime import describe_api_error, describe_close_reason, describe_http_status
 from naretta.redact import RedactingFilter, redact, register_secret
+from naretta.speech import first_sentence
 from naretta.wake import contains_wake_word
 
 
@@ -151,3 +153,36 @@ def test_voice_volume_boost_is_limited_not_clipped():
     buf = PlaybackBuffer(24000, lambda _: None, gain=2.0)
     buf.enqueue("a1", quiet.tobytes())
     assert np.abs(buf.read(2400)).max() > np.abs(quiet).max() * 1.8
+
+
+def test_capability_log_round_trip_and_redaction(tmp_path):
+    log = CapabilityLog(tmp_path / "sub" / "missing.jsonl")
+    assert log.entries() == []
+    assert log.record("Set a timer for 5 minutes", "timers", "No clock", "I can't set timers yet.")
+    assert log.record("Use sk-abcdefghijklmnopqrstuvwx for this", "account access")
+    with log.path.open("a", encoding="utf-8") as f:
+        f.write('{"cut short')  # a partial line from a crash is skipped
+    first, second = log.entries()
+    assert first["capability"] == "timers" and first["reply"] == "I can't set timers yet."
+    assert "time" in first
+    assert "sk-abcdefghijklmnop" not in second["request"]
+
+
+def test_api_errors_are_explained():
+    credit = {"type": "insufficient_quota", "code": "credit_balance_exhausted", "message": "You have no credits remaining."}
+    message, fatal = describe_api_error(credit)
+    assert fatal and message.startswith("Your OpenAI credit has run out")
+    assert describe_api_error({"code": "invalid_api_key"})[1] is True
+    message, fatal = describe_api_error({"type": "rate_limit_exceeded", "code": "rate_limit_exceeded"})
+    assert not fatal and "too many requests" in message
+    assert describe_api_error({"code": "other", "message": "Odd"}) == ("OpenAI reported a problem: Odd", False)
+    assert describe_close_reason("insufficient_quota.credit_balance_exhausted").startswith("Your OpenAI credit")
+    assert describe_close_reason("") is None
+
+
+def test_first_sentence_is_the_spoken_headline():
+    assert first_sentence("Your OpenAI credit has run out, so Naretta can't reply. Add credit at platform.openai.com.") == (
+        "Your OpenAI credit has run out, so Naretta can't reply."
+    )
+    assert first_sentence("Can't reach OpenAI. Check your internet connection.") == "Can't reach OpenAI."
+    assert first_sentence("No full stop") == "No full stop"

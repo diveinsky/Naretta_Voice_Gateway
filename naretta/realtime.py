@@ -21,7 +21,17 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 
 from .audio import AudioError, Microphone, Speaker, VoiceProcessor, voice_level
-from .config import PERSONALITY, SAMPLE_RATE, TRANSCRIBE_PROMPT, SessionConfig
+from .capability_log import CapabilityLog
+from .config import (
+    CAPABILITY_INSTRUCTIONS,
+    CAPABILITY_TOOL,
+    END_CONVERSATION_TOOL,
+    LISTENING_INSTRUCTIONS,
+    PERSONALITY,
+    SAMPLE_RATE,
+    TRANSCRIBE_PROMPT,
+    SessionConfig,
+)
 from .history import ConversationHistory, estimate_heard_text
 from .redact import redact, register_secret
 from .wake import contains_wake_word
@@ -35,6 +45,9 @@ RECONNECTING = "reconnecting"
 CONNECTED = "connected"
 
 RECONNECT_DELAYS = (1, 2, 4)
+# Only a session that lasted this long resets the retry count, so a server that accepts the
+# connection and then drops it at once can't keep Naretta reconnecting forever.
+STABLE_SESSION_SECONDS = 30
 # In wake-word mode, Naretta goes back to waiting after this much quiet.
 WAKE_IDLE_SECONDS = 20
 QUIET_MIC_WARNING_SECONDS = 10
@@ -49,9 +62,11 @@ CLIP_WARNING_RATIO = 0.05
 
 def _turn_detection(responds: bool) -> dict:
     # Wake-word mode keeps voice detection running while waiting, but without auto-replies.
+    # Low eagerness waits out mid-sentence pauses ("Can you... smell?") instead of answering
+    # the first half; a sentence that sounds finished still gets a quick reply.
     return {
         "type": "semantic_vad",
-        "eagerness": "auto",
+        "eagerness": "low",
         "create_response": responds,
         "interrupt_response": responds,
     }
@@ -86,7 +101,7 @@ class _SessionReset(Exception):
 def describe_http_status(status: int, model: str) -> tuple[str, bool]:
     """Returns (user-facing message, retryable) for a rejected WebSocket handshake."""
     if status == 401:
-        return ("OpenAI rejected the API key. Open Settings and paste a valid key.", False)
+        return (KEY_REJECTED, False)
     if status == 403:
         return (
             f"This API key doesn't have access to the realtime model “{model}”. "
@@ -106,6 +121,36 @@ def describe_http_status(status: int, model: str) -> tuple[str, bool]:
     return (f"OpenAI refused the connection (HTTP {status}).", False)
 
 
+KEY_REJECTED = "OpenAI rejected the API key. Open Settings and paste a valid key."
+CREDIT_EXHAUSTED = (
+    "Your OpenAI credit has run out, so Naretta can't reply. Add credit at platform.openai.com "
+    "\u203a Settings \u203a Billing, then press Start."
+)
+RATE_LIMITED = "OpenAI is getting too many requests from this key right now. Wait a minute, then try again."
+
+
+def describe_api_error(error: dict) -> tuple[str, bool]:
+    """Returns (user-facing message, fatal) for an error object sent by the Realtime API."""
+    code = error.get("code") or ""
+    kind = error.get("type") or ""
+    if code == "invalid_api_key":
+        return (KEY_REJECTED, True)
+    if "insufficient_quota" in (kind, code) or code == "credit_balance_exhausted":
+        return (CREDIT_EXHAUSTED, True)
+    if "rate_limit_exceeded" in (kind, code):
+        return (RATE_LIMITED, False)
+    return (f"OpenAI reported a problem: {redact(error.get('message') or 'Unknown error')}", False)
+
+
+def describe_close_reason(reason: str) -> str | None:
+    """A fatal message for a connection OpenAI closed on purpose, such as for running out of credit."""
+    if "insufficient_quota" in reason or "credit_balance_exhausted" in reason:
+        return CREDIT_EXHAUSTED
+    if "invalid_api_key" in reason:
+        return KEY_REJECTED
+    return None
+
+
 AudioFactory = Callable[..., tuple[Microphone, Speaker]]
 
 
@@ -118,10 +163,21 @@ def default_audio_factory(cfg: SessionConfig, on_chunk, on_playing_changed, on_f
 
 
 class RealtimeEngine:
-    def __init__(self, listener: Listener, audio_factory: AudioFactory = default_audio_factory):
+    # Whether muted microphone chunks still reach the send loop (which then decides what to send).
+    _SEND_WHILE_MUTED = False
+
+    def __init__(
+        self,
+        listener: Listener,
+        audio_factory: AudioFactory = default_audio_factory,
+        capability_log: CapabilityLog | None = None,
+        history: ConversationHistory | None = None,
+    ):
         self._listener = listener
         self._audio_factory = audio_factory
-        self.history = ConversationHistory()
+        self.capability_log = capability_log or CapabilityLog()
+        self.history = history or ConversationHistory()
+        self._session_failure: Exception | None = None
 
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
@@ -142,6 +198,7 @@ class RealtimeEngine:
         self._speaker: Speaker | None = None
         self._ws = None
         self._mic_queue: asyncio.Queue[bytes] | None = None
+        self._usage_input = self._usage_output = 0  # tokens since Start
         self._reset_session_state()
 
     # ------------------------------------------------------------------ public API
@@ -213,11 +270,14 @@ class RealtimeEngine:
         self._muted = muted
         if muted and self._ws is not None:
             # Discard any half-spoken turn so muting doesn't trigger a reply.
-            await self._send({"type": "input_audio_buffer.clear"}, quiet=True)
+            await self._discard_pending_input()
             for turn in self.history.unfinished("user"):
                 if not turn.text:
                     self.history.remove(turn.item_id)
                     self._listener.on_user_turn(turn.item_id, "", "empty")
+
+    async def _discard_pending_input(self) -> None:
+        await self._send({"type": "input_audio_buffer.clear"}, quiet=True)
 
     async def _new_conversation(self) -> None:
         self.history.clear()
@@ -237,34 +297,35 @@ class RealtimeEngine:
     async def _run(self, cfg: SessionConfig) -> None:
         self._cfg = cfg
         self._awake = cfg.listen_mode != "wake"
+        self._usage_input = self._usage_output = 0
         self._listener.on_connection_state(CONNECTING)
         try:
             self._open_audio(cfg)
             failures = 0
             while True:
                 try:
-                    async with connect(
-                        cfg.endpoint,
-                        additional_headers={"Authorization": f"Bearer {cfg.api_key}"},
-                        max_size=None,
-                        open_timeout=15,
-                        ping_interval=20,
-                        ping_timeout=20,
-                        close_timeout=2,
-                    ) as ws:
-                        failures = 0
-                        await self._session(ws, cfg)
+                    async with self._connect(cfg) as ws:
+                        opened = self._loop.time()
+                        try:
+                            await self._session(ws, cfg)
+                        finally:
+                            if self._loop.time() - opened >= STABLE_SESSION_SECONDS:
+                                failures = 0
                     # Session reset (New conversation): reconnect right away.
                     self._listener.on_connection_state(CONNECTING)
                     continue
                 except InvalidStatus as exc:
-                    message, retryable = describe_http_status(exc.response.status_code, cfg.model)
+                    message, retryable = self._describe_http_status(exc.response.status_code, cfg)
                     if not retryable:
                         raise FatalSessionError(message) from None
                     reason = message
                 except FatalSessionError:
                     raise
                 except (ConnectionClosed, InvalidHandshake, OSError, asyncio.TimeoutError) as exc:
+                    closed = getattr(exc, "rcvd", None)
+                    fatal = self._describe_close(closed) if closed is not None else None
+                    if fatal:
+                        raise FatalSessionError(fatal) from None
                     reason = self._describe_network_error(exc)
                 log.warning("Connection problem: %s", redact(reason))
                 failures += 1
@@ -287,6 +348,32 @@ class RealtimeEngine:
             self._end_session()
             self._close_audio()
             self._listener.on_connection_state(DISCONNECTED)
+
+    @staticmethod
+    def _connect(cfg: SessionConfig):
+        return connect(
+            cfg.endpoint,
+            additional_headers={"Authorization": f"Bearer {cfg.api_key}"},
+            max_size=None,
+            open_timeout=15,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=2,
+        )
+
+    @staticmethod
+    def _describe_http_status(status: int, cfg: SessionConfig) -> tuple[str, bool]:
+        return describe_http_status(status, cfg.model)
+
+    @staticmethod
+    def _describe_close(closed) -> str | None:
+        return describe_close_reason(closed.reason)
+
+    def _fail_session(self, exc: Exception) -> None:
+        """Ends the session with `exc` from code outside the session's own tasks."""
+        self._session_failure = exc
+        for task in self._session_tasks:
+            task.cancel()
 
     @staticmethod
     def _describe_network_error(exc: Exception) -> str:
@@ -333,9 +420,8 @@ class RealtimeEngine:
         self._reset_session_state()
         self._ws = ws
         self._mic_queue = asyncio.Queue(maxsize=100)
-        await self._send(self._session_update(cfg, self._responds()))
-        for item in self.history.replay_items():
-            await self._send({"type": "conversation.item.create", "item": item}, quiet=True)
+        self._session_failure = None
+        await self._begin_session(cfg)
         self._listener.on_connection_state(CONNECTED)
         if cfg.listen_mode == "wake":
             self._listener.on_wake_state(self._awake)
@@ -354,6 +440,9 @@ class RealtimeEngine:
             await asyncio.gather(*self._session_tasks, return_exceptions=True)
             self._session_tasks = ()
             self._end_session()
+        failure, self._session_failure = self._session_failure, None
+        if failure is not None:
+            raise failure
         if self._reset_requested:
             self._reset_requested = False
             return
@@ -361,6 +450,11 @@ class RealtimeEngine:
             if not task.cancelled() and task.exception() is not None:
                 raise task.exception()
         raise ConnectionClosed(None, None)
+
+    async def _begin_session(self, cfg: SessionConfig) -> None:
+        await self._send(self._session_update(cfg, self._responds()))
+        for item in self.history.replay_items():
+            await self._send({"type": "conversation.item.create", "item": item}, quiet=True)
 
     def _end_session(self) -> None:
         self._ws = None
@@ -382,6 +476,8 @@ class RealtimeEngine:
         self._assistant_text: dict[str, str] = {}
         self._response_items: dict[str, list[str]] = {}
         self._sleep_items: set[str] = set()  # turns heard while waiting for the wake word
+        self._end_pending = False  # the user asked to stop; waiting for the goodbye to play
+        self._goodbye_requested = False  # she ended without a word, so a goodbye was asked for
         self._user_speaking = False
 
     def _finish_open_turns(self) -> None:
@@ -416,14 +512,17 @@ class RealtimeEngine:
         self._touch()
         log.info("Wake word mode: %s", "awake" if awake else "waiting for the wake word")
         if self._ws is not None:
-            await self._send(
-                {
-                    "type": "session.update",
-                    "session": {"type": "realtime", "audio": {"input": {"turn_detection": _turn_detection(awake)}}},
-                },
-                quiet=True,
-            )
+            await self._apply_awake(awake)
             self._listener.on_wake_state(awake)
+
+    async def _apply_awake(self, awake: bool) -> None:
+        await self._send(
+            {
+                "type": "session.update",
+                "session": {"type": "realtime", "audio": {"input": {"turn_detection": _turn_detection(awake)}}},
+            },
+            quiet=True,
+        )
 
     async def _idle_watch(self) -> None:
         while True:
@@ -444,8 +543,10 @@ class RealtimeEngine:
             "session": {
                 "type": "realtime",
                 "model": cfg.model,
-                "instructions": PERSONALITY,
+                "instructions": f"{PERSONALITY}\n\n{LISTENING_INSTRUCTIONS}\n\n{CAPABILITY_INSTRUCTIONS}",
                 "output_modalities": ["audio"],
+                "tools": [CAPABILITY_TOOL, END_CONVERSATION_TOOL],
+                "tool_choice": "auto",
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
@@ -480,7 +581,7 @@ class RealtimeEngine:
         self._check_mic_signal(peak, samples.size)
         self._input_level = 0.0 if self._muted else voice_level(samples)
         queue = self._mic_queue
-        if queue is None or self._muted:
+        if queue is None or (self._muted and not self._SEND_WHILE_MUTED):
             return
         if queue.full():
             queue.get_nowait()  # fall behind gracefully instead of growing latency
@@ -567,6 +668,7 @@ class RealtimeEngine:
     async def _on_speech_started(self, event: dict) -> None:
         log.info("Speech detected")
         self._user_speaking = True
+        self._end_pending = False  # they kept talking after all
         self._touch()
         await self._barge_in()
         item_id = event.get("item_id")
@@ -727,12 +829,18 @@ class RealtimeEngine:
         if response_id == self._active_response:
             self._active_response = None
         status = response.get("status")
+        self._log_usage(response.get("usage"))
         if status == "failed":
             error = (response.get("status_details") or {}).get("error") or {}
-            message = error.get("message") or "Naretta couldn't finish that reply."
-            self._listener.on_notice(redact(message))
+            log.warning("Reply failed: %s %s", error.get("type"), error.get("code"))
+            message, fatal = describe_api_error(error) if error else ("Naretta couldn't finish that reply.", False)
+            if fatal:
+                raise FatalSessionError(message)
+            self._listener.on_notice(message)
+        item_ids = self._response_items.pop(response_id, [])
+        reply = " ".join(t.text for t in map(self.history.get, item_ids) if t is not None and t.text)
         # Settle any bubble that never got a final transcript (e.g. cut off before audio arrived).
-        for item_id in self._response_items.pop(response_id, []):
+        for item_id in item_ids:
             turn = self.history.get(item_id)
             if turn is not None and not turn.final and item_id not in self._interrupted:
                 if turn.text:
@@ -742,19 +850,110 @@ class RealtimeEngine:
                     self.history.remove(item_id)
                     self._listener.on_assistant_turn(item_id, "", "empty")
         self._dropped_responses.discard(response_id)
+        if self._goodbye_requested:
+            self._goodbye_requested = False
+            if status == "completed":
+                asyncio.create_task(self._end_after_goodbye(item_ids))
+        output = response.get("output") or []
+        calls = [i for i in output if i.get("type") == "function_call" and i.get("status") == "completed"]
+        if calls:
+            await self._answer_function_calls(calls, reply, item_ids, finish=status == "completed")
+
+    def _log_usage(self, usage: dict | None) -> None:
+        """Logs what each reply cost in tokens; OpenAI bills audio tokens far above text ones."""
+        if not usage:
+            return
+        given = usage.get("input_token_details") or {}
+        made = usage.get("output_token_details") or {}
+        self._usage_input += usage.get("input_tokens", 0)
+        self._usage_output += usage.get("output_tokens", 0)
+        log.info(
+            "Reply used %d input tokens (%d audio, %d cached) and %d output tokens (%d audio); "
+            "this session: %d in, %d out",
+            usage.get("input_tokens", 0), given.get("audio_tokens", 0), given.get("cached_tokens", 0),
+            usage.get("output_tokens", 0), made.get("audio_tokens", 0),
+            self._usage_input, self._usage_output,
+        )
+
+    async def _answer_function_calls(self, calls: list[dict], reply: str, item_ids: list[str], finish: bool) -> None:
+        ending = False
+        for call in calls:
+            if call.get("name") == CAPABILITY_TOOL["name"]:
+                result = {"ok": self._record_missing_capability(call.get("arguments"), reply)}
+            elif call.get("name") == END_CONVERSATION_TOOL["name"]:
+                ending = True
+                result = {"ok": True}
+            else:
+                result = {"ok": False, "error": f"Unknown function {call.get('name')}"}
+            await self._send(
+                {
+                    "type": "conversation.item.create",
+                    "item": {"type": "function_call_output", "call_id": call.get("call_id"), "output": json.dumps(result)},
+                },
+                quiet=True,
+            )
+        if ending and any(self._received_ms.get(i) for i in item_ids):
+            asyncio.create_task(self._end_after_goodbye(item_ids))
+        elif ending:
+            self._goodbye_requested = True
+            await self._send(
+                {
+                    "type": "response.create",
+                    "response": {"instructions": "Say a short, warm goodbye in one sentence.", "tool_choice": "none"},
+                }
+            )
+        # She often says "I can't do that, but..." before the call and finishes after it.
+        elif finish and self._responds() and not self._user_speaking:
+            await self._send({"type": "response.create"})
+
+    async def _end_after_goodbye(self, item_ids: list[str]) -> None:
+        """Stops (or, in wake-word mode, goes back to waiting) once the goodbye has played."""
+        self._end_pending = True
+        for _ in range(300):  # give up waiting after 30 s
+            speaker = self._speaker
+            if not self._end_pending:
+                return
+            if speaker is None or all(speaker.played_ms(i) >= self._received_ms.get(i, 0.0) - 1 for i in item_ids):
+                break
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(0.4)  # let the last of the audio leave the speaker
+        if not self._end_pending:
+            return
+        self._end_pending = False
+        log.info("Conversation ended at the user's request")
+        if self._cfg is not None and self._cfg.listen_mode == "wake":
+            await self._set_awake(False)
+        else:
+            asyncio.create_task(self._stop())
+
+    def _record_missing_capability(self, arguments: str | None, reply: str) -> bool:
+        try:
+            args = json.loads(arguments or "{}")
+        except ValueError:
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        capability = str(args.get("capability") or "unspecified")
+        log.info("Missing capability noted: %s", redact(capability))
+        return self.capability_log.record(
+            request=str(args.get("request") or ""),
+            capability=capability,
+            reason=str(args.get("reason") or ""),
+            reply=reply,
+        )
 
     async def _on_error(self, event: dict) -> None:
         error = event.get("error") or {}
         code = error.get("code") or ""
-        message = redact(error.get("message") or "Unknown error")
-        log.warning("Server error %s: %s", code, message)
-        if code == "invalid_api_key":
-            raise FatalSessionError("OpenAI rejected the API key. Open Settings and paste a valid key.")
+        log.warning("Server error %s: %s", code, redact(error.get("message") or "Unknown error"))
+        message, fatal = describe_api_error(error)
+        if fatal:
+            raise FatalSessionError(message)
         if code == "session_expired":
             raise ConnectionClosed(None, None)
         if str(error.get("event_id") or "").startswith("quiet_"):
             return  # e.g. truncating audio that already finished; harmless
-        self._listener.on_notice(f"OpenAI reported a problem: {message}")
+        self._listener.on_notice(message)
 
     _HANDLERS = {
         "session.created": _on_session_event,

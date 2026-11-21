@@ -1,25 +1,28 @@
-"""Settings: audio devices, voice, and the OpenAI API key."""
+"""Settings: audio devices, voice service and voice, and the API keys."""
 
 from __future__ import annotations
 
 import math
 
 import numpy as np
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
+    QWidget,
 )
 
 from .. import credentials
@@ -28,6 +31,8 @@ from ..config import (
     ANIMATION_STYLES,
     LISTEN_MODES,
     MIC_MODES,
+    PROVIDERS,
+    SARVAM_VOICES,
     THEMES,
     TRANSCRIBE_LANGUAGES,
     VOICE_VOLUMES,
@@ -36,17 +41,76 @@ from ..config import (
 from ..settings import SettingsStore
 
 SYSTEM_DEFAULT = "System default"
+# The dialog never grows taller than this share of the screen; the rest scrolls.
+MAX_SCREEN_SHARE = 0.85
+
+
+class Section(QFrame):
+    """A titled panel that folds away to one header line, showing a summary while folded."""
+
+    def __init__(self, title: str, expanded: bool = False, on_toggled=None):
+        super().__init__()
+        self.setObjectName("section")
+        self._title = title
+        self._summary = ""
+        self._on_toggled = on_toggled
+        self.header = QPushButton()  # (a QToolButton ignores left-aligned text in style sheets)
+        self.header.setObjectName("sectionHeader")
+        self.header.setCheckable(True)
+        self.header.setChecked(expanded)
+        self.header.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.body = QWidget()
+        self.body.setVisible(expanded)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(2)
+        layout.addWidget(self.header)
+        layout.addWidget(self.body)
+        self.header.toggled.connect(self.set_expanded)
+        self._update_header()
+
+    def is_expanded(self) -> bool:
+        return self.header.isChecked()
+
+    def set_expanded(self, expanded: bool) -> None:
+        self.header.setChecked(expanded)
+        self.body.setVisible(expanded)
+        self.updateGeometry()  # Qt caches sizes while a window is hidden
+        self._update_header()
+        if self._on_toggled is not None:
+            self._on_toggled()
+
+    def set_summary(self, summary: str) -> None:
+        self._summary = summary
+        self._update_header()
+
+    def _update_header(self) -> None:
+        expanded = self.is_expanded()
+        arrow = "\u25be" if expanded else "\u25b8"
+        text = f"{arrow}  {self._title}"
+        if self._summary and not expanded:
+            text += f"   \u00b7   {self._summary}"
+        self.header.setText(text)
+        self.header.setToolTip("Hide" if expanded else "Show")
+
+
+# provider: (group title, where to get a key)
+KEY_HELP = {
+    "openai": ("OpenAI API key", "platform.openai.com/api-keys"),
+    "sarvam": ("Sarvam API key", "dashboard.sarvam.ai"),
+}
 
 
 class SettingsDialog(QDialog):
     def __init__(self, store: SettingsStore, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Naretta — Settings")
+        self.setWindowTitle("Settings")  # Qt adds " - Naretta"
         self.setMinimumWidth(480)
         self._store = store
 
-        audio_box = QGroupBox("Audio")
-        audio_form = QFormLayout(audio_box)
+        self.audio_section = Section("Audio", on_toggled=self._fit_height)
+        audio_form = QFormLayout(self.audio_section.body)
+        audio_form.setContentsMargins(4, 6, 4, 6)
         self.mic_combo = QComboBox()
         self.speaker_combo = QComboBox()
         refresh = QPushButton("Refresh devices")
@@ -96,12 +160,27 @@ class SettingsDialog(QDialog):
         self._test_timer.timeout.connect(self._update_meter)
         audio_form.addRow(self.device_error)
 
-        voice_box = QGroupBox("Assistant")
-        voice_form = QFormLayout(voice_box)
+        self.assistant_section = Section("Assistant", expanded=True, on_toggled=self._fit_height)
+        voice_form = QFormLayout(self.assistant_section.body)
+        voice_form.setContentsMargins(4, 6, 4, 6)
+        self._voice_form = voice_form
+        self.provider_combo = QComboBox()
+        for provider, label in PROVIDERS.items():
+            self.provider_combo.addItem(label, provider)
+        self.provider_combo.setToolTip(
+            "OpenAI hears and speaks in one step and replies fastest. Sarvam AI chains "
+            "speech-to-text, chat and text-to-speech, with Indian voices and languages."
+        )
+        voice_form.addRow("Voice service", self.provider_combo)
         self.voice_combo = QComboBox()
         for voice in VOICES:
             self.voice_combo.addItem(voice.capitalize(), voice)
         voice_form.addRow("Voice", self.voice_combo)
+        self.sarvam_voice_combo = QComboBox()
+        for voice, label in SARVAM_VOICES.items():
+            self.sarvam_voice_combo.addItem(label, voice)
+        voice_form.addRow("Voice", self.sarvam_voice_combo)
+        self.provider_combo.currentIndexChanged.connect(self._show_provider_voices)
         self.animation_combo = QComboBox()
         for style, label in ANIMATION_STYLES.items():
             self.animation_combo.addItem(label, style)
@@ -124,22 +203,16 @@ class SettingsDialog(QDialog):
             self.theme_combo.addItem(label, theme)
         voice_form.addRow("Background", self.theme_combo)
 
-        key_box = QGroupBox("OpenAI API key")
-        key_layout = QVBoxLayout(key_box)
-        key_row = QHBoxLayout()
-        self.key_edit = QLineEdit()
-        self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key_edit.setPlaceholderText("Paste a new key to replace the current one")
-        self.key_edit.setClearButtonEnabled(True)
-        self.remove_key_button = QPushButton("Remove saved key")
-        self.remove_key_button.clicked.connect(self._remove_key)
-        key_row.addWidget(self.key_edit, 1)
-        key_row.addWidget(self.remove_key_button)
-        self.key_status = QLabel()
-        self.key_status.setWordWrap(True)
-        self.key_status.setObjectName("mutedText")
-        key_layout.addLayout(key_row)
-        key_layout.addWidget(self.key_status)
+        self.key_edits: dict[str, QLineEdit] = {}
+        self.key_statuses: dict[str, QLabel] = {}
+        self.remove_key_buttons: dict[str, QPushButton] = {}
+        self.keys_section = Section("API keys", on_toggled=self._fit_height)
+        keys_layout = QVBoxLayout(self.keys_section.body)
+        keys_layout.setContentsMargins(4, 6, 4, 6)
+        for provider in KEY_HELP:
+            keys_layout.addWidget(self._key_box(provider))
+        self.key_edit = self.key_edits["openai"]
+        self.sarvam_key_edit = self.key_edits["sarvam"]
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
@@ -147,13 +220,31 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
 
+        content = QWidget()
+        content.setObjectName("settingsContent")
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 6, 0)
+        content_layout.setSpacing(10)
+        for section in (self.audio_section, self.assistant_section, self.keys_section):
+            content_layout.addWidget(section)
+        content_layout.addStretch(1)
+        self._content = content
+        self._scroll = QScrollArea()
+        self._scroll.setObjectName("settingsScroll")
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setWidget(content)
+        self._buttons = buttons
+
         layout = QVBoxLayout(self)
-        layout.addWidget(audio_box)
-        layout.addWidget(voice_box)
-        layout.addWidget(key_box)
+        layout.addWidget(self._scroll, 1)
         layout.addWidget(buttons)
 
+        self._select(self.provider_combo, store.provider)
         self._select(self.voice_combo, store.voice)
+        self._select(self.sarvam_voice_combo, store.sarvam_voice)
+        self._show_provider_voices()
         self._select(self.mic_mode_combo, store.mic_mode)
         self.echo_check.setChecked(store.echo_cancellation)
         self._select(self.volume_combo, store.voice_volume)
@@ -162,7 +253,75 @@ class SettingsDialog(QDialog):
         self._select(self.language_combo, store.transcribe_language)
         self._select(self.theme_combo, store.theme)
         self._load_devices()
-        self._refresh_key_status()
+        for provider in KEY_HELP:
+            self._refresh_key_status(provider)
+        for combo in (self.mic_combo, self.speaker_combo, self.provider_combo, self.voice_combo, self.sarvam_voice_combo):
+            combo.currentIndexChanged.connect(self._update_summaries)
+        self._update_summaries()
+        self._fit_height()
+
+    def _update_summaries(self) -> None:
+        """What a folded section shows in its header line."""
+        self.audio_section.set_summary(self.mic_combo.currentText())
+        sarvam = self.provider_combo.currentData() == "sarvam"
+        voice = (self.sarvam_voice_combo if sarvam else self.voice_combo).currentText()
+        self.assistant_section.set_summary(f"{self.provider_combo.currentText().split(' (')[0]}, {voice}")
+        keys = [
+            f"{KEY_HELP[p][0].split(' ')[0]} {'set' if credentials.resolve_api_key(p)[0] else 'missing'}"
+            for p in KEY_HELP
+        ]
+        self.keys_section.set_summary(", ".join(keys))
+
+    def _fit_height(self) -> None:
+        """Grows or shrinks with the open sections, up to most of the screen; the rest scrolls."""
+        if not hasattr(self, "_content"):
+            return  # still being built
+        self._content.layout().invalidate()
+        layout = self.layout()
+        margins = layout.contentsMargins()
+        wanted = (
+            self._content.sizeHint().height() + self._buttons.sizeHint().height()
+            + layout.spacing() + margins.top() + margins.bottom() + 4
+        )
+        screen = self.screen()
+        cap = int(screen.availableGeometry().height() * MAX_SCREEN_SHARE) if screen else 700
+        # Leave room for the scrollbar so it never covers the right edge of the fields.
+        width = (
+            self._content.sizeHint().width() + self._scroll.verticalScrollBar().sizeHint().width()
+            + margins.left() + margins.right() + 8
+        )
+        self.setMinimumWidth(max(480, width))
+        self.resize(max(self.width(), self.minimumWidth()), min(wanted, cap))
+
+    def _key_box(self, provider: str) -> QWidget:
+        title, _ = KEY_HELP[provider]
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 8)
+        heading = QLabel(title)
+        heading.setObjectName("keyHeading")
+        layout.addWidget(heading)
+        row = QHBoxLayout()
+        edit = QLineEdit()
+        edit.setEchoMode(QLineEdit.EchoMode.Password)
+        edit.setPlaceholderText("Paste a new key to replace the current one")
+        edit.setClearButtonEnabled(True)
+        remove = QPushButton("Remove saved key")
+        remove.clicked.connect(lambda: self._remove_key(provider))
+        row.addWidget(edit, 1)
+        row.addWidget(remove)
+        status = QLabel()
+        status.setWordWrap(True)
+        status.setObjectName("mutedText")
+        layout.addLayout(row)
+        layout.addWidget(status)
+        self.key_edits[provider], self.key_statuses[provider], self.remove_key_buttons[provider] = edit, status, remove
+        return box
+
+    def _show_provider_voices(self) -> None:
+        sarvam = self.provider_combo.currentData() == "sarvam"
+        self._voice_form.setRowVisible(self.voice_combo, not sarvam)
+        self._voice_form.setRowVisible(self.sarvam_voice_combo, sarvam)
 
     @staticmethod
     def _select(combo: QComboBox, data) -> None:
@@ -190,23 +349,25 @@ class SettingsDialog(QDialog):
                 combo.addItem(f"{current} (not connected)", current)
             self._select(combo, current)
 
-    def _refresh_key_status(self) -> None:
-        key, source = credentials.resolve_api_key()
+    def _refresh_key_status(self, provider: str) -> None:
+        key, source = credentials.resolve_api_key(provider)
         if key:
-            self.key_status.setText(f"A key is set (from {source}). It is never shown here.")
+            self.key_statuses[provider].setText(f"A key is set (from {source}). It is never shown here.")
         else:
-            self.key_status.setText(
-                "No key yet. Paste one from platform.openai.com/api-keys — it will be saved "
+            self.key_statuses[provider].setText(
+                f"No key yet. Paste one from {KEY_HELP[provider][1]} \u2014 it will be saved "
                 "in Windows Credential Manager."
             )
-        self.remove_key_button.setEnabled(credentials.load_saved_key() is not None)
+        self.remove_key_buttons[provider].setEnabled(credentials.load_saved_key(provider) is not None)
+        if hasattr(self, "keys_section"):
+            self._update_summaries()
 
-    def _remove_key(self) -> None:
+    def _remove_key(self, provider: str) -> None:
         try:
-            credentials.delete_saved_key()
+            credentials.delete_saved_key(provider)
         except credentials.CredentialError as exc:
             QMessageBox.warning(self, "Naretta", str(exc))
-        self._refresh_key_status()
+        self._refresh_key_status(provider)
 
     # ------------------------------------------------------------------ microphone test
 
@@ -256,17 +417,21 @@ class SettingsDialog(QDialog):
         super().done(result)
 
     def _save(self) -> None:
-        new_key = self.key_edit.text().strip()
-        if new_key:
+        for provider, edit in self.key_edits.items():
+            new_key = edit.text().strip()
+            if not new_key:
+                continue
             if any(ch.isspace() for ch in new_key):
-                QMessageBox.warning(self, "Naretta", "The API key shouldn't contain spaces.")
+                QMessageBox.warning(self, "Naretta", "An API key shouldn't contain spaces.")
                 return
             try:
-                credentials.save_key(new_key)
+                credentials.save_key(new_key, provider)
             except credentials.CredentialError as exc:
                 QMessageBox.warning(self, "Naretta", str(exc))
                 return
-            self.key_edit.clear()
+            edit.clear()
+        self._store.provider = self.provider_combo.currentData()
+        self._store.sarvam_voice = self.sarvam_voice_combo.currentData()
         self._store.input_device = self.mic_combo.currentData()
         self._store.output_device = self.speaker_combo.currentData()
         self._store.voice = self.voice_combo.currentData()

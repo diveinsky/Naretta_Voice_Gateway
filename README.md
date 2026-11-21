@@ -4,15 +4,23 @@
 conversation. Click **Start conversation**, talk, and Naretta answers out loud. If you talk over
 her, she stops at once and listens.
 
-Built with Python, PySide6 and the OpenAI Realtime API (speech-to-speech over WebSocket,
-model `gpt-realtime-2.1`; your words are transcribed for the chat with `gpt-4o-transcribe`).
+Built with Python and PySide6. Naretta can run on either of two voice services, chosen in
+**Settings › Voice service**:
+
+- **OpenAI** (default): the Realtime API, speech-to-speech over WebSocket with model
+  `gpt-realtime-2.1`; your words are transcribed for the chat with `gpt-4o-transcribe`.
+- **Sarvam AI**: strong on Indian languages and voices. Sarvam has no speech-to-speech model, so
+  Naretta chains three of its services: Saaras `saaras:v4` realtime speech-to-text, the
+  `sarvam-105b-conversations` chat model, and Bulbul `bulbul:v4-flash` text-to-speech. Replies
+  start about 1.3–1.7 s after you stop talking (OpenAI is usually quicker), and she hears only
+  your words, not your tone.
 
 ## Requirements
 
 - Windows 10 or 11
 - Python 3.10–3.13 (64-bit) from [python.org](https://www.python.org/downloads/windows/)
 - A microphone and speakers or headphones (headphones recommended, see [Testing with headphones](#testing-with-headphones))
-- An OpenAI API key with access to the Realtime API
+- An OpenAI API key with access to the Realtime API, or a Sarvam AI API key
 
 ## Setup (Windows, PowerShell)
 
@@ -29,16 +37,17 @@ If PowerShell blocks `Activate.ps1`, run
 
 ## Adding your API key
 
-Choose one:
+Naretta needs a key for the voice service chosen in **Settings › Voice service**. Settings has a
+field for each service. Choose one way per key:
 
-1. **Settings (recommended).** Open **Settings**, paste the key into the masked field and click
-   **Save**. It goes into Windows Credential Manager (generic credential `Naretta`) and loads
-   automatically on the next launch. **Remove saved key** deletes it.
-2. **Environment variable.** Set `OPENAI_API_KEY` for your user:
-   `setx OPENAI_API_KEY "sk-..."` (then open a new terminal), or copy `.env.example` to `.env`
-   next to `main.py` / `Naretta.exe` and fill it in.
+1. **Settings (recommended).** Open **Settings**, paste the key into the masked field for that
+   service and click **Save**. It goes into Windows Credential Manager (generic credential
+   `Naretta`) and loads automatically on the next launch. **Remove saved key** deletes it.
+2. **Environment variable.** Set `OPENAI_API_KEY` or `SARVAM_API_KEY` for your user, for
+   example `setx SARVAM_API_KEY "sk_..."` (then open a new terminal), or copy `.env.example` to
+   `.env` next to `main.py` / `Naretta.exe` and fill it in.
 
-A key saved in Settings takes priority over `OPENAI_API_KEY`. The key is never written to source
+A key saved in Settings takes priority over the environment variable. The key is never written to source
 files, settings, or the log, and it is removed from error messages.
 
 ## Using Naretta
@@ -84,6 +93,34 @@ you speak) and to her voice while she speaks (purple). **Settings › Animation*
 - Settings other than the key are stored in `HKCU\Software\Naretta`. Logs are in
   `%LOCALAPPDATA%\Naretta\naretta.log`.
 
+## When she mishears, or you want to stop
+
+- If what she heard is garbled, cut off, or doesn't fit the conversation, she says she didn't
+  catch it and asks you to repeat or confirm ("Did you say…?") instead of guessing.
+- If it sounds like background talk (a TV, someone nearby), she asks whether to carry on with
+  the current topic or stop. A clear change of topic, she simply follows.
+- Say you're done ("let's stop here", "that's all, bye") and she says a short goodbye, then ends
+  the conversation and releases the microphone, like pressing **Stop**. In wake-word mode she
+  goes back to waiting for "Naretta" instead. Talking during the goodbye cancels the stop.
+- She waits out short pauses mid-sentence ("Can you… smell?") before answering, so a question
+  isn't cut in half.
+
+## Requests Naretta can't do yet
+
+Naretta has no tools: no internet, clock, files, accounts, timers or music, and she can't sing
+or use senses other than hearing (sight, smell, taste, touch).
+When you ask for one of those, she says so and records the request in
+`%LOCALAPPDATA%\Naretta\missing_capabilities.jsonl`, one JSON object per line:
+
+```json
+{"time": "2026-11-16T15:40:02+05:30", "capability": "live weather", "request": "Weather in Chennai", "reason": "No internet access", "reply": "I can't check the weather right now..."}
+```
+
+Use it to decide which tools or agents to add next, or as data for later training. The model
+decides what counts as a missing ability, so a few requests may not be recorded (for example
+"remember my name for next time", which she treats as partly possible). Delete the file to start
+over.
+
 ## Echo cancellation
 
 **Settings › Echo cancellation and voice cleanup** (on by default) runs your microphone through
@@ -124,7 +161,7 @@ pip install -r requirements-dev.txt
 `build.ps1` runs:
 
 ```powershell
-pyinstaller --noconfirm --clean --onefile --windowed --name Naretta `
+.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onefile --windowed --name Naretta `
   --hidden-import keyring.backends.Windows --collect-submodules win32ctypes --collect-all livekit `
   --exclude-module PySide6.QtWebEngineCore --exclude-module PySide6.QtWebEngineWidgets `
   --exclude-module PySide6.Qt3DCore --exclude-module tkinter main.py
@@ -135,9 +172,17 @@ start it the first time while it unpacks.
 
 ## Troubleshooting
 
+When Naretta has to stop because of an error, she shows the message and says its first
+sentence aloud with the built-in Windows voice. That voice works offline and costs nothing,
+since OpenAI can't speak for her at that point.
+
 | Message | What to do |
 | --- | --- |
+| *Your Sarvam credit has run out* | Add credit in your Sarvam AI dashboard, then press **Start**. |
+| *Sarvam rejected the API key* | Paste a valid Sarvam key in Settings. |
+| *Your OpenAI credit has run out* | Add credit at **platform.openai.com › Settings › Billing**, then press **Start**. Naretta stops instead of reconnecting, since retrying can't help. |
 | *OpenAI rejected the API key* | Paste a valid key in Settings (check for stray characters). |
+| *OpenAI is getting too many requests* | Wait a minute and try again. |
 | *doesn't have access to the realtime model* | The key's project needs Realtime access; check project permissions and billing. |
 | *rate limit or quota was exceeded* | Check your OpenAI plan and usage. |
 | *Can't reach OpenAI* / *Reconnecting…* | Check the network or proxy. Naretta retries 3 times, keeping the conversation. |
@@ -145,6 +190,12 @@ start it the first time while it unpacks.
 | *The selected microphone … isn't available* | Plug it in or choose another device in Settings. |
 | Naretta sounds quiet | OpenAI's voice audio peaks around -12 dBFS. Raise **Settings › Voice volume** (300% is the default, 400% the maximum; peaks are soft-limited) and check Naretta's slider in Windows **Volume mixer**. |
 | Naretta interrupts herself | Echo from speakers. See [Testing with headphones](#testing-with-headphones). |
+
+**What it costs:** the log records the tokens each reply used, plus a running total since **Start**
+("Reply used … input tokens (… audio, … cached) and … output tokens"). Audio tokens cost far more
+than text ones. Each reply also re-reads the whole conversation so far as input, so replies get
+more expensive as a conversation grows; **New conversation** resets that. See
+platform.openai.com › Usage for the amounts billed.
 
 Set `NARETTA_DEBUG=1` for detailed logs. `NARETTA_MODEL` and `NARETTA_TRANSCRIBE_MODEL` override
 the default models.

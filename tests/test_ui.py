@@ -6,7 +6,7 @@ from PySide6.QtWidgets import QApplication
 
 from naretta import credentials
 from naretta.settings import SettingsStore
-from naretta.ui import settings_dialog
+from naretta.ui import main_window, settings_dialog
 from naretta.ui.main_window import MainWindow
 from naretta.ui.settings_dialog import SettingsDialog
 
@@ -28,6 +28,14 @@ class FakeEngine:
         return (0.6, 0.8)
 
 
+@pytest.fixture(autouse=True)
+def spoken(monkeypatch):
+    """Records what would be said with the Windows voice instead of saying it."""
+    said = []
+    monkeypatch.setattr(main_window, "speak_locally", said.append)
+    return said
+
+
 @pytest.fixture
 def store(tmp_path):
     return SettingsStore(QSettings(str(tmp_path / "s.ini"), QSettings.Format.IniFormat))
@@ -36,14 +44,16 @@ def store(tmp_path):
 @pytest.fixture
 def fake_keyring(monkeypatch):
     saved = {}
-    monkeypatch.setattr(credentials, "load_saved_key", lambda: saved.get("key"))
-    monkeypatch.setattr(credentials, "save_key", lambda k: saved.__setitem__("key", k))
-    monkeypatch.setattr(credentials, "delete_saved_key", lambda: saved.pop("key", None))
+    name = lambda provider: "key" if provider == "openai" else f"{provider}_key"
+    monkeypatch.setattr(credentials, "load_saved_key", lambda provider="openai": saved.get(name(provider)))
+    monkeypatch.setattr(credentials, "save_key", lambda k, provider="openai": saved.__setitem__(name(provider), k))
+    monkeypatch.setattr(credentials, "delete_saved_key", lambda provider="openai": saved.pop(name(provider), None))
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("SARVAM_API_KEY", raising=False)
     return saved
 
 
-def test_window_status_and_chat(app, store, fake_keyring, monkeypatch):
+def test_window_status_and_chat(app, store, fake_keyring, monkeypatch, spoken):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-env-key-1234567890")
     window = MainWindow(store, engine_factory=FakeEngine)
     assert window.windowTitle() == "Naretta"
@@ -89,6 +99,7 @@ def test_window_status_and_chat(app, store, fake_keyring, monkeypatch):
     bridge.on_connection_state("disconnected")
     app.processEvents()
     assert not window.banner.isHidden()
+    assert spoken == ["OpenAI rejected the API key."]
     assert window.status_text == "Disconnected"
     assert window.main_button.toolTip() == "Start conversation"
 
@@ -235,3 +246,41 @@ def test_settings_saves_listening_language_and_background(app, store, fake_keyri
     assert store.session_config("sk-x-123456789").echo_cancellation is False
     cfg = store.session_config("sk-x-123456789")
     assert (cfg.listen_mode, cfg.transcribe_language, store.theme) == ("wake", "hi", "light")
+
+
+def test_settings_choose_sarvam_and_start_with_its_key(app, store, fake_keyring, monkeypatch):
+    monkeypatch.setattr(settings_dialog, "list_devices", lambda kind: [])
+    dialog = SettingsDialog(store)
+    assert dialog.sarvam_key_edit.echoMode() == dialog.sarvam_key_edit.EchoMode.Password
+    dialog.provider_combo.setCurrentIndex(dialog.provider_combo.findData("sarvam"))
+    assert dialog._voice_form.isRowVisible(dialog.sarvam_voice_combo)
+    assert not dialog._voice_form.isRowVisible(dialog.voice_combo)
+    dialog.sarvam_voice_combo.setCurrentIndex(dialog.sarvam_voice_combo.findData("ishita_enhi_companion"))
+    dialog.sarvam_key_edit.setText("sk_sarvam_abcdefghijkl")
+    dialog._save()
+    assert fake_keyring == {"sarvam_key": "sk_sarvam_abcdefghijkl"}  # the OpenAI key is untouched
+    assert store.provider == "sarvam" and store.sarvam_voice == "ishita_enhi_companion"
+
+    window = MainWindow(store, engine_factory=FakeEngine)
+    window.start_conversation()
+    [(name, (cfg,))] = [c for c in window.engine.calls if c[0] == "start"]
+    assert cfg.provider == "sarvam" and cfg.api_key == "sk_sarvam_abcdefghijkl"
+    assert cfg.sarvam_voice == "ishita_enhi_companion"
+    window.close()
+
+
+def test_settings_sections_fold_and_summarize(app, store, fake_keyring, monkeypatch):
+    monkeypatch.setattr(settings_dialog, "list_devices", lambda kind: ["Headset Microphone"] if kind == "input" else [])
+    fake_keyring["sarvam_key"] = "sk_sarvam_abcdefghijkl"
+    dialog = SettingsDialog(store)
+    assert dialog.assistant_section.is_expanded()
+    assert not dialog.audio_section.is_expanded() and not dialog.keys_section.is_expanded()
+    assert "OpenAI missing, Sarvam set" in dialog.keys_section.header.text()
+    dialog.assistant_section.set_expanded(False)
+    folded = dialog.height()  # all three folded: just the headers and buttons
+    dialog.audio_section.set_expanded(True)
+    dialog.keys_section.set_expanded(True)
+    assert dialog.height() > folded  # opening sections grows the dialog...
+    screen = dialog.screen().availableGeometry().height()
+    assert dialog.height() <= screen * settings_dialog.MAX_SCREEN_SHARE + 1  # ...but never past the cap
+    assert "OpenAI" not in dialog.keys_section.header.text()  # no summary while open

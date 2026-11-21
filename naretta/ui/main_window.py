@@ -28,8 +28,11 @@ from PySide6.QtWidgets import (
 )
 
 from .. import credentials
-from ..realtime import CONNECTED, CONNECTING, DISCONNECTED, RECONNECTING, RealtimeEngine
+from ..config import PROVIDERS
+from ..engines import ProviderEngine
+from ..realtime import CONNECTED, CONNECTING, DISCONNECTED, RECONNECTING
 from ..settings import SettingsStore
+from ..speech import first_sentence, speak_locally
 from .chat_view import ChatView
 from .settings_dialog import SettingsDialog
 from .style import SURFACE_COLORS, build_stylesheet
@@ -214,7 +217,7 @@ class CircleSurface(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, store: SettingsStore | None = None, engine_factory=RealtimeEngine):
+    def __init__(self, store: SettingsStore | None = None, engine_factory=ProviderEngine):
         super().__init__()
         self.setWindowTitle("Naretta")
         self.setWindowFlags(
@@ -360,7 +363,7 @@ class MainWindow(QMainWindow):
 
         self.bridge.connection_state.connect(self._on_connection_state)
         self.bridge.speaking.connect(self._on_speaking)
-        self.bridge.error.connect(lambda message: self.show_banner(message, error=True))
+        self.bridge.error.connect(self._on_engine_error)
         self.bridge.notice.connect(lambda message: self.show_banner(message, error=False))
         self.bridge.user_turn.connect(lambda i, t, s: self.chat.upsert(i, "user", t, s))
         self.bridge.assistant_turn.connect(lambda i, t, s: self.chat.upsert(i, "assistant", t, s))
@@ -373,16 +376,18 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ actions
 
     def start_conversation(self) -> None:
-        key, _ = credentials.resolve_api_key()
+        key, _ = credentials.resolve_api_key(self.store.provider)
         if not key:
+            service = PROVIDERS[self.store.provider].split(" (")[0]
+            variable = credentials.KEYS[self.store.provider][1]
             QMessageBox.information(
                 self,
                 "Naretta",
-                "Naretta needs an OpenAI API key. Paste it in Settings, or set the "
-                "OPENAI_API_KEY environment variable.",
+                f"Naretta needs a {service} API key. Paste it in Settings, or set the "
+                f"{variable} environment variable.",
             )
             self.open_settings()
-            key, _ = credentials.resolve_api_key()
+            key, _ = credentials.resolve_api_key(self.store.provider)
             if not key:
                 return
         self.banner.hide()
@@ -456,10 +461,15 @@ class MainWindow(QMainWindow):
         self.orb.set_animation_style(self.store.animation_style)
         self.apply_theme(self.store.theme)
         if self._connection != DISCONNECTED:
-            key, _ = credentials.resolve_api_key()
+            key, _ = credentials.resolve_api_key(self.store.provider)
             if key:
                 # Reopen devices and the session with the new settings; history is kept.
                 self.engine.restart(self.store.session_config(key))
+
+    def _on_engine_error(self, message: str) -> None:
+        self.show_banner(message, error=True)
+        # The voice service can't speak for her now, so the headline is said with the Windows voice.
+        speak_locally(first_sentence(message))
 
     def show_banner(self, message: str, error: bool) -> None:
         if self._orb_view:
